@@ -36,6 +36,15 @@ import { after } from 'next/server';
 import type { Chat } from '@/lib/db/schema';
 import { differenceInSeconds } from 'date-fns';
 import { ChatSDKError } from '@/lib/errors';
+import { S2 } from "@s2-dev/streamstore";
+import { ReadAcceptEnum } from '@s2-dev/streamstore/sdk/records.js';
+import { EventStream } from '@s2-dev/streamstore/lib/event-streams.js';
+import { ReadBatch, ReadEvent } from '@s2-dev/streamstore/models/components';
+
+
+const s2 = new S2({
+  accessToken: "YAAAAAAAAABoKKKXemvUtmN+OKZfmM9pkUJEfLN03fR7/ymV",  
+})
 
 export const maxDuration = 60;
 
@@ -224,15 +233,185 @@ export async function POST(request: Request) {
       },
     });
 
-    const streamContext = getStreamContext();
+    console.log('streamId', streamId);
+    
+    const [s2Stream, clientStream] = stream.tee();
+    
+    (async () => {
+      const reader = s2Stream.getReader();
+      const BATCH_SIZE = 10;
+      let currentBatch: string[] = [];
+      
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {            
+            if (currentBatch.length > 0) {
+              try {
+                await s2.records.append({
+                  stream: streamId,
+                  appendInput: {
+                    records: currentBatch.map(body => ({ body })),
+                  },
+                }, { serverURL: "https://mehul-teste.b.aws.s2.dev/v1" });
+                console.log(`Appended final batch of ${currentBatch.length} records`);
+              } catch (error) {
+                console.error('Error appending final batch to S2:', error);
+              }
+            }
+            // Append stream end marker
+            await s2.records.append({
+              stream: streamId,
+              appendInput: {
+                records: [{ body: "Stream ended" }],
+              },
+            }, { serverURL: "https://mehul-teste.b.aws.s2.dev/v1" });
+            console.log('Stream ended marker appended');
+            break;
+          }
 
-    if (streamContext) {
-      return new Response(
-        await streamContext.resumableStream(streamId, () => stream),
-      );
-    } else {
-      return new Response(stream);
-    }
+          // Add to current batch
+          currentBatch.push(value);
+          console.log(`Added to batch, current size: ${currentBatch.length}`);
+
+          // If batch is full, append to S2
+          if (currentBatch.length >= BATCH_SIZE) {
+            try {
+              await s2.records.append({
+                stream: streamId,
+                appendInput: {
+                  records: currentBatch.map(body => ({ body })),
+                },
+              }, { serverURL: "https://mehul-teste.b.aws.s2.dev/v1" });
+              console.log(`Appended batch of ${currentBatch.length} records to S2`);
+              currentBatch = []; // Clear the batch after successful append
+            } catch (error) {
+              console.error('Error appending batch to S2:', error);
+              // Continue with next batch even if this one fails
+              currentBatch = [];
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error in S2 append stream:', error);
+      } finally {
+        reader.releaseLock();
+      }
+    })();
+    
+    let abortController: AbortController;
+    let isControllerClosed = false;
+    const READ_TIMEOUT = 30000;
+
+    const handleCancel = () => {
+      console.log('Client stream cancelled');
+      if (abortController) {
+        abortController.abort();
+      }
+    };
+
+    const clientReadableStream = new ReadableStream({
+      async start(controller) {
+        const reader = clientStream.getReader();
+        abortController = new AbortController();
+        const signal = abortController.signal;
+        
+        const streamDone = new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => {
+            console.log('Stream aborted');
+            resolve();
+          });
+        });
+
+        const closeController = () => {
+          if (!isControllerClosed) {
+            try {
+              controller.close();
+              isControllerClosed = true;
+            } catch (error) {
+              if (error instanceof Error && error.name !== 'TypeError') {
+                console.error('Unexpected error while closing controller:', error);
+              } else {
+                console.log('Controller was already closed, no action needed.');
+              }
+            }
+          }
+        };
+
+        const readWithTimeout = async () => {
+          const timeoutPromise = new Promise<{ done: boolean; value: any }>((_, reject) => {
+            setTimeout(() => {
+              reject(new Error('Read timeout'));
+            }, READ_TIMEOUT);
+          });
+
+          try {
+            return await Promise.race([
+              reader.read(),
+              timeoutPromise
+            ]);
+          } catch (error) {
+            if (error instanceof Error && error.message === 'Read timeout') {
+              console.log('Read timeout occurred, aborting stream');
+              abortController.abort();
+              throw error;
+            }
+            throw error;
+          }
+        };
+
+        try {
+          while (!signal.aborted && !isControllerClosed) {
+            let readResult;
+            try {
+              readResult = await readWithTimeout();
+            } catch (error) {
+              if (error instanceof Error && error.message === 'Read timeout') {                
+                break;
+              }
+              throw error;
+            }
+
+            const { done, value } = readResult;
+            
+            if (done || signal.aborted) {
+              closeController();
+              break;
+            }
+
+            if (!signal.aborted && !isControllerClosed) {
+              try {
+                const encodedValue = new TextEncoder().encode(value);
+                controller.enqueue(encodedValue);
+              } catch (error) {
+                console.error('Error enqueueing to client:', error);
+                abortController.abort();
+                closeController();
+                break;
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error in client stream:', error);
+          if (!signal.aborted && !isControllerClosed) {
+            try {
+              controller.error(error);
+              isControllerClosed = true;
+            } catch (closeError) {
+              console.error('Error sending error to client:', closeError);
+            }
+          }
+        } finally {
+          reader.releaseLock();
+          closeController();
+        }
+        
+        await streamDone;
+      },
+      cancel: handleCancel
+    });
+
+    return new Response(clientReadableStream);
   } catch (error) {
     if (error instanceof ChatSDKError) {
       return error.toResponse();
@@ -298,41 +477,82 @@ export async function GET(request: Request) {
     () => emptyDataStream,
   );
 
-  /*
-   * For when the generation is streaming during SSR
-   * but the resumable stream has concluded at this point.
-   */
-  if (!stream) {
-    const messages = await getMessagesByChatId({ id: chatId });
-    const mostRecentMessage = messages.at(-1);
+ 
+  console.log('recentStreamId', recentStreamId);
 
-    if (!mostRecentMessage) {
-      return new Response(emptyDataStream, { status: 200 });
+  const s2Stream = new ReadableStream({
+    async start(controller) {
+      let isClosed = false;
+      try {
+        console.log('Starting to read from S2 stream:', recentStreamId);
+        const records = await s2.records.read(
+          {
+            stream: recentStreamId,
+            seqNum: 0,
+          },
+          {
+            acceptHeaderOverride: ReadAcceptEnum.textEventStream,
+            serverURL: "https://mehul-teste.b.aws.s2.dev/v1",
+          }
+        );
+
+        const recordsStream = records as EventStream<ReadEvent>;
+        let recordCount = 0;
+        let batchCount = 0;
+
+        for await (const record of recordsStream) {
+          if (record.event !== 'batch') continue;
+
+          const batch = record.data as ReadBatch;
+          batchCount++;
+          for (const rec of batch.records) {
+            console.log('Processing record:', rec);
+            if (isClosed) break;
+            recordCount++;
+            if (rec.body === 'Stream ended') {
+              controller.close();
+              isClosed = true;
+              break;
+            }
+            if (rec.body) {
+              try {
+                if (isClosed) break;
+                const encodedValue = new TextEncoder().encode(rec.body);
+                controller.enqueue(encodedValue);
+                console.log('Enqueued record:', rec.body);
+                // sleep for 1 second
+                // await new Promise(resolve => setTimeout(resolve, 10000));
+                
+              } catch (error) {
+                if (!isClosed) {
+                  console.error('Error processing record:', error);
+                }
+              }
+            }
+          }
+          if (isClosed) break;
+        }
+
+        if (!isClosed) controller.close();
+      } catch (error) {
+        console.error('Error reading from S2 stream:', error);
+        try {
+          controller.error(error);
+        } catch (closeError) {
+          console.error('Error sending error to client:', closeError);
+        }
+      }
     }
+  });
 
-    if (mostRecentMessage.role !== 'assistant') {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    const messageCreatedAt = new Date(mostRecentMessage.createdAt);
-
-    if (differenceInSeconds(resumeRequestedAt, messageCreatedAt) > 15) {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    const restoredStream = createDataStream({
-      execute: (buffer) => {
-        buffer.writeData({
-          type: 'append-message',
-          message: JSON.stringify(mostRecentMessage),
-        });
-      },
-    });
-
-    return new Response(restoredStream, { status: 200 });
-  }
-
-  return new Response(stream, { status: 200 });
+  return new Response(s2Stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  });
 }
 
 export async function DELETE(request: Request) {

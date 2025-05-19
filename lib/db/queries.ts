@@ -192,6 +192,7 @@ export async function getChatsByUserId({
       hasMore,
     };
   } catch (error) {
+    console.log(error)
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to get chats by user id',

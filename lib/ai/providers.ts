@@ -3,7 +3,8 @@ import {
   extractReasoningMiddleware,
   wrapLanguageModel,
 } from 'ai';
-import { xai } from '@ai-sdk/xai';
+// import { xai } from '@ai-sdk/xai';
+import { anthropic } from '@ai-sdk/anthropic';
 import { isTestEnvironment } from '../constants';
 import {
   artifactModel,
@@ -23,15 +24,15 @@ export const myProvider = isTestEnvironment
     })
   : customProvider({
       languageModels: {
-        'chat-model': xai('grok-2-vision-1212'),
+        'chat-model': anthropic('claude-3-5-sonnet-20241022'),
         'chat-model-reasoning': wrapLanguageModel({
-          model: xai('grok-3-mini-beta'),
+          model: anthropic('cclaude-3-5-sonnet-20241022'),
           middleware: extractReasoningMiddleware({ tagName: 'think' }),
         }),
-        'title-model': xai('grok-2-1212'),
-        'artifact-model': xai('grok-2-1212'),
+        'title-model': anthropic('claude-3-haiku-20240307'),
+        'artifact-model': anthropic('claude-3-haiku-20240307'),
       },
       imageModels: {
-        'small-model': xai.image('grok-2-image'),
+        // 'small-model': xai.image('grok-2-image'),
       },
     });
